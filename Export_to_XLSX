@@ -1,1 +1,283 @@
+import struct
+import os
+import re
+import numpy as np
+import pandas as pd
+from scipy.signal import find_peaks
 
+# Path
+INPUT_DIR = r"C:\Pathtofiles\data+"
+WORKING_DIR = r"C:outputpathforxlsx\output"
+
+os.makedirs(WORKING_DIR, exist_ok=True)
+
+#These are some default values which you must set in accordance with you experiment
+# DEFAULT_AREA_CM2 = 0.24718129   # When using different electrodes, toggle on/off
+DEFAULT_AREA_CM2 = 0.65325021     # area in cm^2 electrode
+
+DEFAULT_THICKNESS_MM = 0.550      #Sample thickness in millimeters
+DEFAULT_TEMPERATURE_C = 25        # placeholder until variable-temp runs are supported
+
+EPSILON_0 = 8.854187817e-12       # Permittivity of free space (F/m), constant
+
+# Optional per-file overrides. Key = any substring that appears in the
+# filename; value = dict of the fields to override for that file only.
+# Leave empty ({}) to just use the defaults above for everything.
+# Example:
+# OVERRIDES = {
+#     "0.30GPa": {"Sample_Thickness_mm": 0.612},
+#     "1.10GPa": {"Sample_Area_cm2": 0.24718129, "Temperature_C": 25},
+# }
+OVERRIDES = {}
+
+ROW_SIZE = 168  # bytes per data row in the Solartron binary block
+
+
+# PEAK-DETECTION SETTINGS (used to find the tau relaxation peaks)
+# Prominence: how far a peak must stand above its local surroundings,
+# expressed as a fraction of that column's full (max-min) range. Filters out single-point noise spikes.
+PEAK_PROMINENCE_FRACTION = 0.05
+
+# Minimum number of consecutive samples a peak must span. Filters out
+# single-sample blips that happen to have some local prominence.
+PEAK_MIN_WIDTH = 3
+
+def get_overrides_for(filename):
+    """Return {thickness_mm, area_cm2, temp_c} for this file, defaults + any match."""
+    thickness_mm = DEFAULT_THICKNESS_MM
+    area_cm2 = DEFAULT_AREA_CM2
+    temp_c = DEFAULT_TEMPERATURE_C
+
+    for key, vals in OVERRIDES.items():
+        if key in filename:
+            thickness_mm = vals.get("Sample_Thickness_mm", thickness_mm)
+            area_cm2 = vals.get("Sample_Area_cm2", area_cm2)
+            temp_c = vals.get("Temperature_C", temp_c)
+
+    return thickness_mm, area_cm2, temp_c
+
+def parse_dat_file(file_path):
+    """Locate the alignment marker and unpack freq / Z' / Z'' rows. Returns a DataFrame."""
+    with open(file_path, "rb") as f:
+        raw_bytes = f.read()
+
+    start_offset = raw_bytes.find(struct.pack("<d", 10000000.0))
+    if start_offset == -1:
+        return None
+
+    clean_bytes = raw_bytes[start_offset:]
+    total_rows = len(clean_bytes) // ROW_SIZE
+
+    raw_data = []
+    for i in range(total_rows):
+        row = clean_bytes[i * ROW_SIZE: (i + 1) * ROW_SIZE]
+        freq = struct.unpack("<d", row[0:8])[0]
+        z_real = struct.unpack("<d", row[48:56])[0]
+        z_imag = struct.unpack("<d", row[56:64])[0]
+        raw_data.append([freq, z_real, z_imag])
+
+    return pd.DataFrame(raw_data, columns=["Frequency (Hz)", "Z Real (Ohms)", "Z Imag (Ohms)"])
+
+
+def build_output_name(filename):
+    """Mirror the master-sheet naming convention (e.g. '0.30 GPa') but for a standalone file."""
+    base_name = os.path.splitext(filename)[0]
+    return f"{base_name}_analysis.xlsx"
+
+def calculate_parameters(df, thickness_mm, area_cm2, temp_c):
+    """Take raw freq/Z'/Z'' and return the full derived-parameter DataFrame."""
+    freq = df["Frequency (Hz)"].to_numpy()
+    z_real = df["Z Real (Ohms)"].to_numpy()
+    z_imag = df["Z Imag (Ohms)"].to_numpy()
+
+    t = float(thickness_mm) / 1000.0   # mm -> m
+    a = float(area_cm2) / 10000.0      # cm^2 -> m^2
+
+    z_mag = np.sqrt(z_real**2 + z_imag**2)
+    phase_rad = np.arctan2(z_imag, z_real)
+    phase_deg = np.arcsin(z_imag / z_mag) * (180 / np.pi)
+    tan_delta = np.abs(z_real / z_imag)
+
+    denom = z_real**2 + z_imag**2
+    y_real = z_real / denom
+    y_imag = -z_imag / denom
+    y_mag = 1.0 / z_mag
+
+    omega = 2 * np.pi * freq
+    geom_factor = t / a
+    c_0 = (EPSILON_0 * a) / t
+
+    sigma_real = y_real * geom_factor
+    sigma_imag = y_imag * geom_factor
+    sigma_mag = y_mag * geom_factor
+
+    eps_real = y_imag / (omega * c_0)
+    eps_imag = y_real / (omega * c_0)
+    eps_mag = np.sqrt(eps_real**2 + eps_imag**2)
+
+    eps_denom = eps_real**2 + eps_imag**2
+    m_real = eps_real / eps_denom
+    m_imag = eps_imag / eps_denom
+    m_mag = 1.0 / eps_mag
+
+    # Relaxation time, per row. Both conventions kept since different
+    # readers/papers default to one or the other.
+    tau_1_over_f = 1.0 / freq
+    tau_1_over_2pi_f = 1.0 / (2 * np.pi * freq)
+
+    z_complex_str = [f"{r:+.4e}{i:+.4e}j" for r, i in zip(z_real, z_imag)]
+    eps_complex_str = [f"{r:+.4e}{-i:+.4e}j" for r, i in zip(eps_real, eps_imag)]
+    m_complex_str = [f"{r:+.4e}{i:+.4e}j" for r, i in zip(m_real, m_imag)]
+
+    n = len(freq)
+    return pd.DataFrame({
+        "Frequency (Hz)": freq,
+        "Sample_Thickness_mm": np.full(n, thickness_mm),
+        "Sample_Area_cm2": np.full(n, area_cm2),
+        "Temperature_C": np.full(n, temp_c),
+        "Z Real (Ohms)": z_real,
+        "Z Imag (Ohms)": z_imag,
+        "Z Magnitude (Ohms)": z_mag,
+        "Complex Impedance (Z*)": z_complex_str,
+        "Phase (Degrees)": phase_deg,
+        "Phase (Radians)": phase_rad,
+        "Tan Delta": tan_delta,
+        "Y Real (S)": y_real,
+        "Y Imag (S)": y_imag,
+        "Y Magnitude (S)": y_mag,
+        "Conductivity Real (S/m)": sigma_real,
+        "Conductivity Imag (S/m)": sigma_imag,
+        "Conductivity Magnitude (S/m)": sigma_mag,
+        "Permittivity Real (eps')": eps_real,
+        "Permittivity Imag (eps'')": eps_imag,
+        "Permittivity Magnitude": eps_mag,
+        "Complex Permittivity (eps*)": eps_complex_str,
+        "Modulus Real (M')": m_real,
+        "Modulus Imag (M'')": m_imag,
+        "Modulus Magnitude": m_mag,
+        "Complex Modulus (M*)": m_complex_str,
+        "Tau_1_over_f (s)": tau_1_over_f,
+        "Tau_1_over_2pi_f (s)": tau_1_over_2pi_f,
+    })
+
+
+def find_relaxation_peak(freq, values):
+    """
+    Robust single-peak detection for a relaxation curve (Z'', M'', or Tan Delta vs frequency). Returns a dict with the peak frequency, peak value, both tau
+    conventions at that frequency, and a status flag.
+
+    Uses scipy.signal.find_peaks with a prominence and width requirement so a single stray/noisy data point cannot masquerade as the relaxation peak.
+    find_peaks only considers points with neighbors on both sides, so a maximum sitting at the very first/last frequency point is never returned
+    here -- that case is instead caught separately and flagged, since it usually means the true relaxation lies outside the measured frequency
+    window rather than that there is no peak at all.
+    """
+    order = np.argsort(freq)
+    f_sorted = np.asarray(freq)[order]
+    v_sorted = np.asarray(values)[order]
+    v_abs = np.abs(v_sorted)
+
+    result = {
+        "Peak_Frequency (Hz)": np.nan,
+        "Peak_Value": np.nan,
+        "Tau_1_over_f (s)": np.nan,
+        "Tau_1_over_2pi_f (s)": np.nan,
+        "Num_Candidate_Peaks": 0,
+        "Status": "no peak found",
+    }
+
+    finite_mask = np.isfinite(v_abs)
+    if finite_mask.sum() < PEAK_MIN_WIDTH * 2:
+        return result
+
+    v_range = np.nanmax(v_abs[finite_mask]) - np.nanmin(v_abs[finite_mask])
+    if v_range <= 0:
+        return result
+
+    min_prominence = PEAK_PROMINENCE_FRACTION * v_range
+
+    peak_idx, props = find_peaks(
+        np.nan_to_num(v_abs, nan=-np.inf),
+        prominence=min_prominence,
+        width=PEAK_MIN_WIDTH,
+    )
+
+    if len(peak_idx) == 0:
+        # No interior peak survived the filters. Check whether the raw
+        # global maximum sits at the edge of the frequency window -- if so
+        # that's an "extend your range" signal rather than "no relaxation".
+        global_max_idx = np.nanargmax(v_abs)
+        if global_max_idx in (0, len(v_abs) - 1):
+            result["Status"] = "no peak found - possible edge effect, extend frequency range"
+        return result
+
+    # Pick the most prominent candidate as the primary peak.
+    best = peak_idx[np.argmax(props["prominences"])]
+    peak_freq = f_sorted[best]
+
+    result["Peak_Frequency (Hz)"] = peak_freq
+    result["Peak_Value"] = v_sorted[best]
+    result["Tau_1_over_f (s)"] = 1.0 / peak_freq
+    result["Tau_1_over_2pi_f (s)"] = 1.0 / (2 * np.pi * peak_freq)
+    result["Num_Candidate_Peaks"] = len(peak_idx)
+    result["Status"] = "clean" if len(peak_idx) == 1 else "multiple peaks found - review"
+
+    return result
+
+
+def build_peak_summary(final_df):
+    """Run peak detection on Z'', M'', and Tan Delta; return a one-row-per-quantity DataFrame."""
+    freq = final_df["Frequency (Hz)"].to_numpy()
+
+    quantities = {
+        "Z'' (Z Imag)": final_df["Z Imag (Ohms)"].to_numpy(),
+        "M'' (Modulus Imag)": final_df["Modulus Imag (M'')"].to_numpy(),
+        "Tan Delta": final_df["Tan Delta"].to_numpy(),
+    }
+
+    rows = []
+    for label, values in quantities.items():
+        peak_info = find_relaxation_peak(freq, values)
+        rows.append({"Quantity": label, **peak_info})
+
+    return pd.DataFrame(rows)
+
+
+def main():
+    dat_files = [f for f in os.listdir(INPUT_DIR) if f.endswith(".dat")]
+    print(f"Found {len(dat_files)} .dat files in: {INPUT_DIR}\n")
+
+    processed = 0
+    skipped = []
+
+    for filename in dat_files:
+        file_path = os.path.join(INPUT_DIR, filename)
+        raw_df = parse_dat_file(file_path)
+
+        if raw_df is None or raw_df.empty:
+            skipped.append(filename)
+            print(f"  -> Skipped (no alignment marker found): {filename}")
+            continue
+
+        thickness_mm, area_cm2, temp_c = get_overrides_for(filename)
+        final_df = calculate_parameters(raw_df, thickness_mm, area_cm2, temp_c)
+        peak_summary_df = build_peak_summary(final_df)
+
+        output_name = build_output_name(filename)
+        output_path = os.path.join(WORKING_DIR, output_name)
+
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            final_df.to_excel(writer, sheet_name="Data", index=False)
+            peak_summary_df.to_excel(writer, sheet_name="Peak_Summary", index=False)
+
+        processed += 1
+        print(f"  -> Processed: {filename}  ->  {output_name}")
+        for _, row in peak_summary_df.iterrows():
+            print(f"       {row['Quantity']}: {row['Status']}")
+
+    print(f"\nDone. {processed} file(s) written to: {WORKING_DIR}")
+    if skipped:
+        print(f"{len(skipped)} file(s) skipped (no valid alignment marker): {skipped}")
+
+
+if __name__ == "__main__":
+    main()
