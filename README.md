@@ -8,3 +8,11 @@ should simplify data management if not using python, and also reduces any calcul
 Originally this was written to extract from Solartron 1260 legacy instrumentation, but has shown adaptable to other hardware such as Parstat and NOVO.
 
 Once data is exported to XLSX, other scripts were weritten to manage the data in different ways for the various types of plots for full parameterization.
+
+Script 2 (Characterization) creates autoscaled plots of Nyquist, Modulus (bode) (M'' vs frequency), phase angle (Phi), and admittance (Y),  Bode (Z'' vs frequency), complex modulus (M'v M''), Tan delta vs frequency, 
+and Permittivity (real and imaginary vs frequency. This way the user can view all the data in one go in a 2X2 plot of data to see how it looks, and which graphs might be more intersting for a closer look. Each plot 
+can be saved manually.  Also included here are a 3D modulus plot, and 3D impedance plot (Z', Z'' or M', M'' vs frequency in a 3 dimensional X,Y,Z plot) for closer inspection.  THIS IS NOT A WATERFALL PLOT but this could be done easily also. The 3D plot.
+
+Script 3
+
+
